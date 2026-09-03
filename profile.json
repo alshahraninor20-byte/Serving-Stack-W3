@@ -1,0 +1,44 @@
+[
+  {
+    "dtype": "fp16",
+    "context": 512,
+    "vram_gb": 6.166,
+    "util_mean": 61.7,
+    "tokens_per_s": 26.8
+  },
+  {
+    "dtype": "fp16",
+    "context": 2048,
+    "vram_gb": 6.355,
+    "util_mean": 72.3,
+    "tokens_per_s": 29.8
+  },
+  {
+    "dtype": "fp16",
+    "context": 4096,
+    "vram_gb": 6.561,
+    "util_mean": 87.0,
+    "tokens_per_s": 25.1
+  },
+  {
+    "dtype": "int8",
+    "context": 512,
+    "vram_gb": 4.854,
+    "util_mean": 23.5,
+    "tokens_per_s": 5.8
+  },
+  {
+    "dtype": "int8",
+    "context": 2048,
+    "vram_gb": 5.084,
+    "util_mean": 27.2,
+    "tokens_per_s": 5.8
+  },
+  {
+    "dtype": "int8",
+    "context": 4096,
+    "vram_gb": 5.357,
+    "util_mean": 29.5,
+    "tokens_per_s": 5.4
+  }
+]
