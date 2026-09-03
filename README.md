@@ -1,268 +1,222 @@
-# Lab W3D1: profile inference on a real GPU
+Lab W3D2: inference anatomy, by hand
+Start: wk2-fastapi checkpoint. A fresh Colab T4 runtime. The shared scaffold at ../shared/colab_scaffold.py. Yesterday's profile.json in your notes for context. Objective: Measure the two halves of a response (time to first token, then the per-token gap), watch the KV cache grow and check it against the arithmetic, and hand-roll static batching to feel where it ceilings. Export the baselines and download them, because tomorrow's A/B has to survive a lost runtime.
 
-Start:      wk2-fastapi checkpoint. A fresh Colab T4 runtime. The shared
-            scaffold at `../shared/colab_scaffold.py`.
-Objective:  Measure how resident VRAM and GPU utilisation actually behave for
-            one model across two dtypes and three context lengths, and see why
-            "the GPU is busy" is not the same as "the GPU is working hard".
+Time: about 3 hours. Checkpoints: install green and the TTFT table by 14:30, KV growth measured by 15:30, baselines.json exported AND downloaded by 16:30 - the download is the one non-negotiable, tomorrow's A/B dies without it.
 
-Time: about 3 hours. Steps carry a rough clock so you can pace it.
-
-## Predict (by hand)
-
+Predict (by hand)
 Credited for handing it in, never marked right or wrong - hedged guesses teach nothing, and nothing here is graded for accuracy.
 
-Fill this in before you run anything. Use only what you know from this morning
-and from week 2 (memory is roughly parameters times bytes per parameter; the KV
-cache grows with context).
+Fill this in before you run anything.
 
-- Qwen2.5-1.5B-Instruct is about 1.5 billion parameters. At fp16 (2 bytes each)
-  the weights alone are about ______ GB. At int8 (1 byte each) about ______ GB.
-- Resident VRAM at 512 context, fp16: ______ GB. At 4096 context, fp16:
-  ______ GB. (Which is larger, and by roughly how much?)
-- During a single-request decode (one prompt, generating tokens one at a time),
-  GPU utilisation will read about ______ percent.
-- Hand in the card before you open Colab.
+Time to first token (TTFT) is dominated by prefill (reading the whole prompt). A longer prompt makes TTFT go ______ (up / down / no change).
+After the first token, decode emits one token at a time. The mean gap between tokens (TPOT) depends mostly on ______ (prompt length / model size and memory bandwidth).
+KV cache math for Qwen2.5-1.5B: 28 layers, 2 KV heads, head_dim 128, fp16. Per token that is 2 (K and V) x 28 x 2 x 128 x 2 bytes = ______ KB per token. So a 4096-token context holds about ______ GB of KV. (Compute it; do not guess.)
+Static batching: if you pad 8 prompts of different lengths and run them as one batch, the batch finishes when the ______ prompt finishes.
+Hand in the card.
+The delta
+Everything today uses transformers directly (no vLLM server). This is the hand-rolled baseline: you build the primitives yourself so tomorrow's engine has something honest to beat.
 
-The last two are the interesting ones. Hold onto your utilisation guess.
+Cell 1: install pins (about 4 min)
+(If Colab drops you mid-afternoon: the shared RECOVERY cell reinstalls this exact set; your baselines.json is the one artifact D3 needs, so download it the moment Cell 5 writes it, not at day's end.)
 
-## The delta
+Paste the pins and installer cell from ../shared/colab_scaffold.py, then INSTALL CELL A (the profiling set - same as day 1). Today is hand-rolled measurement with transformers directly; no server ever starts, and vLLM must NOT be installed in this runtime:
 
-You will load the model directly with transformers and bitsandbytes and profile
-it. There is no vLLM server today; today is about reading the card, not serving.
-
-### Cell 1: install pins and the sampler (about 3 min, mostly download)
-
-Paste the **pins and installer** cell from `../shared/colab_scaffold.py`, then
-paste **INSTALL CELL A** from the same file. Cell A is the profiling set:
-
-```python
 pip_install(
     f"transformers=={TRANSFORMERS_PIN}",
     f"accelerate=={ACCELERATE_PIN}",
-    f"bitsandbytes=={BITSANDBYTES_PIN}",
 )
-```
+Why not the serving set, when days 3 to 5 use it? Verified on a live T4, 2026-08-07: installing vLLM drags numpy below 2, and a direct AutoModelForCausalLM load in that runtime then dies with numpy.dtype size changed inside modeling_qwen2 - exactly the crash day 1's warning describes. vLLM's own server survives it; your hand-rolled cells do not. Serving days install CELL B because they only talk to the server; today you touch the model directly, so today is a CELL A day. (This also makes Cell 1 about 4 minutes, not 30.)
 
-Note what is missing: there is no vLLM today, and that is deliberate. Colab
-already ships a working torch and today you load the model with transformers,
-so Colab's torch is the torch. Installing vLLM here would swap it for vLLM's
-older build and drag numpy back to 1.26, and Colab's preinstalled extensions are
-compiled against numpy 2. The model load then fails with a `numpy.dtype size
-changed` binary-incompatibility error that looks nothing like its cause. Take
-Cell A, not Cell B.
+Load the model once, fp16:
 
-Then paste the **nvidia-smi sampler thread** cell. You will use
-`start_sampler()`, `stop_sampler()`, and `read_util_mean()`.
-
-Confirm you have a GPU:
-
-```python
-!nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-# expect: Tesla T4, 15360 MiB
-```
-
-If that prints no GPU, you have a CPU runtime: Runtime -> Change runtime type ->
-T4 GPU, then rerun. If Colab denies a GPU, use the Kaggle fallback in
-`../shared/README.md`.
-
-### Cell 2: the measurement helper (about 10 min to read and paste)
-
-This is the core of the lab. It loads the model at a given dtype, runs one fixed
-generation at a given context length with the sampler running, and returns a row.
-Read it before you run it; you are being asked to understand what each number
-means.
-
-```python
-import time, gc, torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 tok = AutoTokenizer.from_pretrained(MODEL)
+tok.pad_token = tok.eos_token
+tok.padding_side = "left"
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL, torch_dtype=torch.float16, device_map="cuda")
+Cell 2: TTFT and TPOT by streaming (about 30 min)
+You cannot separate first-token time from per-token time unless you timestamp each token as it arrives. TextIteratorStreamer yields tokens as they generate; run generate() on a background thread and read the stream on the main thread, stamping each yield.
 
-def load(dtype: str):
-    if dtype == "fp16":
-        return AutoModelForCausalLM.from_pretrained(
-            MODEL, torch_dtype=torch.float16, device_map="cuda")
-    if dtype == "int8":
-        qc = BitsAndBytesConfig(load_in_8bit=True)
-        return AutoModelForCausalLM.from_pretrained(
-            MODEL, quantization_config=qc, device_map="cuda")
-    raise ValueError(dtype)
+import time, threading
+from transformers import TextIteratorStreamer
 
-def make_prompt(context_tokens: int) -> str:
-    # a filler prompt padded to about context_tokens input tokens
-    base = "Summarise the following text in one sentence.\n"
-    filler = ("The data center runs many small inference requests all day. " * 400)
-    ids = tok(base + filler)["input_ids"][:context_tokens]
+def prompt_of_len(n_tokens: int) -> str:
+    base = "Explain the following in detail.\n"
+    filler = "A data center serves many inference requests at once. " * 600
+    ids = tok(base + filler)["input_ids"][:n_tokens]
     return tok.decode(ids)
 
-def resident_vram_gb() -> float:
-    torch.cuda.synchronize()
-    return torch.cuda.memory_reserved() / (1024 ** 3)
-
-def profile(model, dtype: str, context: int, new_tokens: int = 128, batch: int = 1):
-    prompt = make_prompt(context)
-    prompts = [prompt] * batch
-    enc = tok(prompts, return_tensors="pt", padding=True).to("cuda")
-    # warm-up (compile/allocate), not measured
-    _ = model.generate(**enc, max_new_tokens=8, do_sample=False)
-    vram = resident_vram_gb()
-    start_sampler()
+def measure_stream(prompt: str, new_tokens: int = 128):
+    enc = tok(prompt, return_tensors="pt").to("cuda")
+    streamer = TextIteratorStreamer(tok, skip_prompt=True,
+                                    skip_special_tokens=True)
+    kwargs = dict(**enc, max_new_tokens=new_tokens, do_sample=False,
+                  streamer=streamer)
+    th = threading.Thread(target=model.generate, kwargs=kwargs)
     t0 = time.time()
-    out = model.generate(**enc, max_new_tokens=new_tokens, do_sample=False)
-    dt = time.time() - t0
-    stop_sampler()
-    gen_tokens = (out.shape[1] - enc["input_ids"].shape[1]) * batch
+    th.start()
+    stamps = []
+    for _ in streamer:
+        stamps.append(time.time())
+    th.join()
+    ttft = stamps[0] - t0
+    # mean inter-token gap over the tokens after the first
+    if len(stamps) > 1:
+        gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+        tpot = sum(gaps) / len(gaps)
+    else:
+        tpot = 0.0
+    total = stamps[-1] - t0
+    return {"ttft_s": round(ttft, 4), "tpot_s": round(tpot, 4),
+            "total_s": round(total, 4), "n_tokens": len(stamps)}
+
+# Warm-up, and it is not optional. The first generation on a fresh runtime pays
+# CUDA context init and kernel autotuning, and all of that lands inside its TTFT.
+# Time it and the shortest prompt comes out slowest, which is backwards and would
+# tell you prefill does not depend on prompt length. Throw one generation away.
+measure_stream(prompt_of_len(128), new_tokens=8)
+
+ttft_by_len = {}
+for n in [128, 512, 2048]:
+    r = measure_stream(prompt_of_len(n))
+    ttft_by_len[str(n)] = r["ttft_s"]
+    print(n, r)
+TTFT climbs with prompt length: prefill reads the whole prompt before the first token. TPOT stays roughly flat across prompt lengths, because decode does the same memory-bound step each time regardless of how long the prompt was. If you measured with streaming off you would get total time and call it TTFT; that is the classic mistake (see failure modes).
+
+Cell 3: KV growth versus the formula (about 30 min, by hand)
+Measure the VRAM delta across a generation at three context lengths, then compare against the computed KV size. The prediction is arithmetic, not a guess.
+
+import gc
+
+def kv_formula_kb_per_token(layers=28, kv_heads=2, head_dim=128, dbytes=2):
+    return 2 * layers * kv_heads * head_dim * dbytes / 1024  # 28.0 KB
+
+def cache_bytes(pkv):
+    """Bytes the KV cache itself holds, read straight off the cache tensors."""
+    if hasattr(pkv, "key_cache"):        # transformers returns a Cache object
+        tensors = list(pkv.key_cache) + list(pkv.value_cache)
+    else:                                # legacy tuple of (k, v) per layer
+        tensors = [t for layer in pkv for t in layer]
+    return sum(t.numel() * t.element_size() for t in tensors)
+
+def measure_kv(context: int, new_tokens: int = 256):
+    torch.cuda.empty_cache(); gc.collect()
+    torch.cuda.reset_peak_memory_stats()
+    enc = tok(prompt_of_len(context), return_tensors="pt").to("cuda")
+    before = torch.cuda.memory_allocated()
+    out = model.generate(**enc, max_new_tokens=new_tokens, do_sample=False,
+                         use_cache=True, return_dict_in_generate=True)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated()
+    total_tokens = out.sequences.shape[1]  # prompt + generated, the full KV span
     return {
-        "dtype": dtype,
         "context": context,
-        "vram_gb": round(vram, 3),
-        "util_mean": round(read_util_mean(), 1),
-        "tokens_per_s": round(gen_tokens / dt, 1),
+        "total_tokens": int(total_tokens),
+        # what the whole generation cost, cache and activations together
+        "peak_kb_per_token": round((peak - before) / total_tokens / 1024, 1),
+        # the cache on its own, which is what the formula predicts
+        "kv_kb_per_token": round(cache_bytes(out.past_key_values) / total_tokens / 1024, 1),
     }
 
-def free_vram():
-    """Hand freed memory back to the driver.
+formula = kv_formula_kb_per_token()
+print("formula KB/token:", formula)
+kv_rows = [measure_kv(c) for c in [512, 2048, 4096]]
+for r in kv_rows:
+    print(r, "  vs formula", formula, "KB/token")
 
-    Delete the model variable yourself first, in the cell, with `del model`.
-    Passing it to a helper does not work: the helper deletes its own local name
-    while your notebook variable still holds the weights, so nothing is freed
-    and empty_cache() has nothing to give back.
-    """
-    gc.collect()
-    torch.cuda.empty_cache()
-```
-
-Note `tok.padding_side` and a pad token: if generation complains about padding,
-set `tok.pad_token = tok.eos_token` and `tok.padding_side = "left"`.
-
-### Cell 3: the matrix (about 40 min, this is the bulk)
-
-Two dtypes, three context lengths, one row each. Load a dtype once, profile it at
-all three contexts, then unload before the next dtype so int8 and fp16 do not sit
-in memory together.
-
-```python
-rows = []
-for dtype in ["fp16", "int8"]:
-    model = load(dtype)
-    for context in [512, 2048, 4096]:
-        row = profile(model, dtype, context)
-        print(row)
-        rows.append(row)
-    del model      # without this the next dtype loads on top of this one
-    free_vram()
-```
-
-Watch what prints. VRAM should climb with context. fp16 VRAM should sit above
-int8 VRAM at the same context. Utilisation during single-request decode will
-read lower than you probably guessed: decode generates one token at a time and
-spends most of each step waiting on memory, not computing. That gap is the whole
-point of the afternoon.
-
-### Cell 4: the utilisation-vs-busy experiment (about 25 min)
-
-Utilisation as nvidia-smi reports it tells you the GPU had work in the queue. It
-does not tell you the work was efficient. Prove it: same model, same everything,
-batch 1 versus batch 8. Both numbers rise, but nothing like together: watch the
-ratio of the ratios. Throughput should multiply several times over while
-utilisation climbs by well under half of that.
-
-```python
-model = load("fp16")
-b1 = profile(model, "fp16", 512, new_tokens=128, batch=1)
-b8 = profile(model, "fp16", 512, new_tokens=128, batch=8)
-del model
-free_vram()
-print("batch 1:", b1)
-print("batch 8:", b8)
-print("tokens/s ratio:", round(b8["tokens_per_s"] / b1["tokens_per_s"], 2))
-print("util delta:", round(b8["util_mean"] - b1["util_mean"], 1))
-```
-
-Divide one ratio by the other. Batch 8 does several times the work per unit time
-for a utilisation reading that is nowhere near several times higher, so the two
-numbers are not measuring the same thing. Utilisation counts intervals in which
-the GPU had at least one kernel resident. It cannot tell a step that saturated
-the card from a step that moved a few bytes and waited, and single-request decode
-is mostly the latter. Utilisation is the number to distrust: it says busy, not
-productive. Note both ratios on your card, because "we were at 90% utilisation"
-is exactly the sentence that will be used on you later to argue a GPU is full. Tuesday's engine swap (day 3) is largely about turning that idle-busy
-into real throughput.
-
-Save the two tokens/s numbers so the green check can read them:
-
-```python
+# the green check compares the cache itself, not the whole-generation peak
 import json
-with open("batch_check.json", "w") as f:
-    json.dump({"batch1_tokens_per_s": b1["tokens_per_s"],
-               "batch8_tokens_per_s": b8["tokens_per_s"]}, f, indent=2)
-```
+with open("kv_check.json", "w") as f:
+    json.dump({"formula_kb_per_token": formula,
+               "measured_kb_per_token": kv_rows[-1]["kv_kb_per_token"],
+               "peak_kb_per_token": kv_rows[-1]["peak_kb_per_token"]}, f)
+Read the two numbers against each other, because the gap between them is the lesson.
 
-### Cell 5: write profile.json (about 10 min)
+kv_kb_per_token should land on 28.0, and not approximately: exactly, at every context length you tried. You predicted it on the card this morning from four integers and no measurement, and the card was right. That is the payoff of an arithmetic prediction over an intuition.
 
-Write the six matrix rows to `profile.json`.
+peak_kb_per_token reads two to three times higher, and climbs with context. That is not the cache. It is activations and allocator workspace during prefill, which also scale with sequence length, riding on top of the cache in the same measurement. Sunday's Cell 9 measured exactly this compound number with memory_reserved and honestly labelled it "KV + activations"; today you have the instrument to pull the two apart.
 
-```python
+Take the discipline, not just the number: the same peak can be read as either figure, and which one is right depends on the question. "What must I budget per concurrent user?" wants the cache. "Will this request OOM the card?" wants the peak. At 4096 the cache alone is about 0.11 GB, small for one request, but multiply by many concurrent users and it is the region that fills the card. That region is what PagedAttention exists to manage, which is tomorrow.
+
+If kv_kb_per_token is not 28.0, something is genuinely wrong rather than merely noisy: use_cache was false, or the model is not the one the formula describes (see failure modes).
+
+Cell 4: hand-rolled static batching (about 30 min)
+Pad and batch 1, 4, and 8 prompts through one generate() call. Measure per request latency and total throughput, and watch the straggler drag the batch.
+
+Two things make this measurement honest, and both matter tomorrow.
+
+It is a queue, not one batch. A single batched call has nothing to wait for. A server has a line of requests and must decide how to group them.
+
+The requests have mixed output lengths, and that is where a straggler comes from. Every sequence in a static batch decodes in lockstep, so a long prompt only wastes prefill, while a long output holds the whole batch for the entire decode. Decode is most of the time, so output length is the tax that matters.
+
+# 24 requests: 18 that want 32 tokens, 6 that want 256. 2112 useful tokens.
+QUEUE = [32, 32, 32, 256] * 6
+
+def static_queue(batch: int, prompt: str = "Explain what an inference server does."):
+    """A server WITHOUT continuous batching: a batch starts, nothing new joins
+    until every member has finished, so it runs until its SLOWEST member."""
+    t0 = time.time(); useful = 0; slots = 0
+    for i in range(0, len(QUEUE), batch):
+        chunk = QUEUE[i:i + batch]
+        n = max(chunk)                    # the batch runs until the slowest
+        enc = tok([prompt] * len(chunk), return_tensors="pt",
+                  padding=True).to("cuda")
+        model.generate(**enc, max_new_tokens=n, do_sample=False)
+        useful += sum(chunk)              # tokens anyone actually asked for
+        slots += n * len(chunk)           # token-slots the GPU actually decoded
+        # accounting note: this counts REQUESTED tokens. Greedy decoding on
+        # these prompts runs to the max_new_tokens cap, so requested equals
+        # generated here; tomorrow's vLLM client counts the server's own
+        # completion_tokens, and its README says so. Same convention, stated.
+    dt = time.time() - t0
+    return {"batch": batch, "wall_s": round(dt, 2),
+            "tokens_per_s": round(useful / dt, 1),
+            "slot_efficiency": round(useful / slots, 3)}
+
+batch_rows = {}
+for n in [1, 4, 8]:
+    r = static_queue(n)
+    batch_rows[str(n)] = r["tokens_per_s"]
+    print(r)
+Throughput still rises from batch 1 to batch 8, because the GPU does more useful work per step when sequences share it. Read slot_efficiency next to it, because that is the number the day is about.
+
+At batch 1 it is 1.0: each request runs alone and every decoded token is a token somebody wanted. The moment you batch mixed lengths it collapses, to roughly a third, and it does not recover as the batch grows. Two thirds of what the GPU decodes is short requests sitting finished in a slot they cannot release, waiting for the 256-token member. That is the straggler tax, it is now a number rather than an assertion, and it is exactly what continuous batching removes tomorrow.
+
+Notice also what it does to scaling. Uniform-length batching would have taken you about 5.6x from batch 1 to batch 8; with a realistic mixed queue you should see roughly half that. The missing half is the ceiling in the morning's "static batching and its ceiling" slide. Write your own 1-to-8 multiple on the card: tomorrow you compute vLLM's, and the gap between the two multiples is the engine's real contribution.
+
+Cell 5: export baselines.json AND download it (about 15 min)
+This is a numbered step, not a remark. Tomorrow's A/B compares vLLM against these exact numbers, and tomorrow you may be on a fresh runtime. If baselines.json only lives in this runtime, a Colab drop erases your comparison. Write it, then download it to your own machine.
+
 import json
-with open("profile.json", "w") as f:
-    json.dump(rows, f, indent=2)
-print("wrote", len(rows), "rows to profile.json")
-```
+baselines = {
+    "model": MODEL,
+    "dtype": "fp16",
+    "ttft_s": ttft_by_len,                    # by prompt length
+    "tpot_s": measure_stream(prompt_of_len(512))["tpot_s"],
+    "batch": {k: v for k, v in batch_rows.items()},  # tokens_per_s at 1,4,8
+}
+with open("baselines.json", "w") as f:
+    json.dump(baselines, f, indent=2)
+print(json.dumps(baselines, indent=2))
+Now download it. Do not skip this line:
 
-Each row is `{dtype, context, vram_gb, util_mean, tokens_per_s}`. Keep the batch
-experiment numbers in your notes; the green check reads `profile.json`.
-
-## Verify (green check)
-
-Paste `verify_cell.py` as the last cell and run it. It checks the schema and the
-sanity rules (VRAM rises with context; fp16 uses more memory than int8; and the
-batch-8 tokens/s you record beats batch-1). Expected final line:
-
-```
-GREEN CHECK: PASS
-```
-
-If it fails, the parenthesis names the rule that broke. Fix the run, not the
-file.
-
-## Stretch
-
-Add int4 (`BitsAndBytesConfig(load_in_4bit=True)`) as a third dtype and a fourth
-context. Watch int4 use even less memory than int8, and confirm it does not run
-faster: at this stage quantisation buys memory, not speed. That is the hook for
-Wednesday, when fused kernels change the story.
-
-## Failure modes
-
-- **Sampler thread left running (doubles your entries).** Tell: `gpu_samples.csv`
-  has interleaved rows, `util_mean` looks wrong, or `read_util_mean` returns a
-  smeared average. Fix: always `stop_sampler()` before the next `start_sampler()`.
-  The scaffold's `start_sampler()` refuses to start a second thread, but if you
-  edited it, check for a stray one and restart the runtime if unsure.
-- **int8 load fails after a runtime reset.** Tell: `ImportError` or a CUDA error
-  from bitsandbytes on the int8 `load()`. Fix: bitsandbytes did not survive the
-  reset; rerun Cell 1 to reinstall it, then retry. int8 needs bitsandbytes and
-  accelerate present.
-- **Context 4096 sits near the fp16 ceiling.** Tell: 4096 fp16 uses noticeably
-  more VRAM and the margin to 15 GB looks thin. That is expected tightness, not a
-  bug; note the number. The closeness is Sunday's lesson: serving fills the spare
-  memory, and 4k contexts eat into it fast.
-- **OOM when both dtypes are loaded at once.** Tell: CUDA out of memory on the
-  int8 load. Fix: you skipped the `del model` line between dtypes. Deleting the
-  variable is what frees the weights; `free_vram()` on its own only returns
-  already-freed blocks to the driver. Restart the runtime and run the matrix
-  loop as written.
-- **Padding error on batch generation.** Tell: generate() raises about a missing
-  pad token or wrong padding side. Fix: `tok.pad_token = tok.eos_token` and
-  `tok.padding_side = "left"` before the batch profile.
-
-## Before you close the tab
-
-Colab runtimes vanish; artifacts in them vanish too. Last cell, every day:
-
-```python
 from google.colab import files
-for f_ in ["profile.json", "batch_check.json"]:
-    files.download(f_)
+files.download("baselines.json")
+Keep the downloaded file. Tomorrow you upload it back.
+
+Verify (green check)
+Paste verify_cell.py as the last cell and run it. It checks the baselines.json schema, that TTFT is less than the total generation time, that batch-8 throughput beats batch-1, and that your measured KV is within a factor of two of the 28 KB/token formula. Expected final line:
+
+GREEN CHECK: PASS
+Stretch
+Plot the per-token timestamps from Cell 2 as a strip: a long flat gap at the start (prefill, before the first token) then a steady comb (decode). You are looking at prefill and decode with your own eyes.
+
+Failure modes
+Measuring TTFT with streaming disabled. Tell: your "TTFT" equals your total generation time and does not change much with prompt length. Fix: TTFT only means anything with a streamer; a plain generate() returns after the last token. Use TextIteratorStreamer and stamp the first yield.
+Padding inflates batch cost (the static-batching tax). Tell: batch-8 wall time is much larger than one request, and throughput gains are smaller than you hoped. This is not a bug; it is the tax. Static batching pads every sequence to the longest and makes all wait for the straggler. Name it in your notes; it is the thing continuous batching fixes.
+KV measurement wildly off the formula. Tell: measured KB/token is a tiny fraction of 28, or enormous. Fix: use_cache=True must be set, and you must reset_peak_memory_stats() before each measurement and read max_memory_allocated() after torch.cuda.synchronize(). Without the reset you read a stale peak from a previous run.
+Forgetting the download (the one that hurts tomorrow). Tell: tomorrow you open a fresh runtime and baselines.json is gone. Fix: run files.download in Cell 5 today and keep the file. If you did lose it, you can regenerate it by rerunning this lab, but that costs you tomorrow's morning.
+Out of memory at batch 8 with long prompts. Tell: CUDA OOM in Cell 4 at n=8. Fix: shorten the straggler prompt (1024 -> 768) or drop new_tokens to 96; the point is the straggler effect, not maxing the card.
