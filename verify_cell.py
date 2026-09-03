@@ -1,9 +1,7 @@
-# Green-check verifier for Lab W3D1 (profile inference).
-# Paste this as the last cell of your day-1 notebook and run it. It reads
-# profile.json (the matrix rows you wrote) and checks the schema and the sanity
-# rules. It also reads the batch experiment numbers if you saved them to
-# batch_check.json; if that file is absent it asks for the two numbers inline so
-# the batch-8 > batch-1 rule can still be checked.
+# Green-check verifier for Lab W3D2 (inference anatomy).
+# Paste this as the last cell of your day-2 notebook and run it. It reads
+# baselines.json (the export you also downloaded) plus the KV measurement you
+# saved to kv_check.json, and checks the schema and the sanity rules.
 #
 # Last line is exactly one of:
 #   GREEN CHECK: PASS
@@ -12,7 +10,8 @@
 
 import json, os
 
-REQUIRED_KEYS = {"dtype", "context", "vram_gb", "util_mean", "tokens_per_s"}
+# Qwen2.5-1.5B KV cache: 2 x 28 layers x 2 kv_heads x 128 head_dim x 2 bytes.
+KV_FORMULA_KB_PER_TOKEN = 2 * 28 * 2 * 128 * 2 / 1024  # 28.0
 
 
 class _Stop(Exception):
@@ -26,7 +25,7 @@ def fail(reason: str) -> "NoReturn":
 
 def load_json(path: str):
     if not os.path.exists(path):
-        fail(f"{path} not found; write it in the last data cell")
+        fail(f"{path} not found")
     try:
         with open(path) as fh:
             return json.load(fh)
@@ -35,72 +34,58 @@ def load_json(path: str):
 
 
 def main() -> None:
-    rows = load_json("profile.json")
-
-    if not isinstance(rows, list) or not rows:
-        fail("profile.json must be a non-empty list of rows")
+    b = load_json("baselines.json")
 
     # schema
-    for i, row in enumerate(rows):
-        if not isinstance(row, dict):
-            fail(f"row {i} is not an object")
-        missing = REQUIRED_KEYS - set(row)
-        if missing:
-            fail(f"row {i} missing keys: {sorted(missing)}")
+    for key in ("model", "dtype", "ttft_s", "tpot_s", "batch"):
+        if key not in b:
+            fail(f"baselines.json missing key: {key}")
+    if not isinstance(b["ttft_s"], dict) or not b["ttft_s"]:
+        fail("ttft_s must be a non-empty object keyed by prompt length")
+    if not isinstance(b["batch"], dict):
+        fail("batch must be an object keyed by batch size")
+    for size in ("1", "4", "8"):
+        if size not in b["batch"]:
+            fail(f"batch missing size {size}")
 
-    dtypes = {r["dtype"] for r in rows}
-    contexts = sorted({r["context"] for r in rows})
-    if "fp16" not in dtypes:
-        fail("no fp16 rows; the matrix needs fp16")
-    if len(contexts) < 3:
-        fail(f"need at least 3 context lengths, found {contexts}")
+    # sanity 1: TTFT rises with prompt length - the day's actual physics.
+    # Prefill reads the whole prompt before the first token, so a 2048-token
+    # prompt must pay a visibly larger TTFT than a 128-token one (the reference
+    # T4 run measured 0.037 s vs 0.312 s). A flat TTFT means prefill was not
+    # measured (cached prompt, wrong timestamps, or a reused stream).
+    tpot = b["tpot_s"]
+    if not isinstance(tpot, (int, float)) or tpot <= 0:
+        fail(f"tpot_s not a positive number: {tpot}")
+    for plen, ttft in b["ttft_s"].items():
+        if not isinstance(ttft, (int, float)) or ttft <= 0:
+            fail(f"ttft_s[{plen}] not a positive number: {ttft}")
+    if not b["ttft_s"]["2048"] > b["ttft_s"]["128"]:
+        fail(f"TTFT did not rise with prompt length "
+             f"(128: {b['ttft_s']['128']}, 2048: {b['ttft_s']['2048']}); "
+             "prefill is not being measured")
 
-    # sanity 1: VRAM rises with context (within each dtype)
-    for dt in dtypes:
-        sub = sorted((r for r in rows if r["dtype"] == dt),
-                     key=lambda r: r["context"])
-        vrams = [r["vram_gb"] for r in sub]
-        if any(b < a - 0.01 for a, b in zip(vrams, vrams[1:])):
-            fail(f"{dt} VRAM does not rise with context: {vrams}")
-
-    # sanity 2: fp16 uses more memory than int8 at a shared context
-    if "int8" in dtypes:
-        shared = None
-        for c in contexts:
-            has_fp16 = any(r["dtype"] == "fp16" and r["context"] == c for r in rows)
-            has_int8 = any(r["dtype"] == "int8" and r["context"] == c for r in rows)
-            if has_fp16 and has_int8:
-                shared = c
-                break
-        if shared is None:
-            fail("fp16 and int8 share no context length to compare")
-        fp16_v = next(r["vram_gb"] for r in rows
-                      if r["dtype"] == "fp16" and r["context"] == shared)
-        int8_v = next(r["vram_gb"] for r in rows
-                      if r["dtype"] == "int8" and r["context"] == shared)
-        if not fp16_v > int8_v:
-            fail(f"fp16 VRAM ({fp16_v}) not above int8 VRAM ({int8_v}) at "
-                 f"context {shared}")
-
-    # sanity 3: batch-8 tokens/s beats batch-1
-    b1 = b8 = None
-    if os.path.exists("batch_check.json"):
-        bc = load_json("batch_check.json")
-        b1 = bc.get("batch1_tokens_per_s")
-        b8 = bc.get("batch8_tokens_per_s")
-    else:
-        # allow the two numbers as module-level names set in an earlier cell
-        b1 = globals().get("BATCH1_TOKENS_PER_S")
-        b8 = globals().get("BATCH8_TOKENS_PER_S")
-    if b1 is None or b8 is None:
-        fail("batch numbers missing; save batch_check.json with "
-             "batch1_tokens_per_s and batch8_tokens_per_s, or set "
-             "BATCH1_TOKENS_PER_S / BATCH8_TOKENS_PER_S")
+    # sanity 2: batch-8 throughput beats batch-1
+    b1, b8 = b["batch"]["1"], b["batch"]["8"]
+    if not (isinstance(b1, (int, float)) and isinstance(b8, (int, float))):
+        fail("batch tokens/s values must be numbers")
     if not b8 > b1:
-        fail(f"batch-8 tokens/s ({b8}) not above batch-1 ({b1})")
+        fail(f"batch-8 throughput ({b8}) not above batch-1 ({b1})")
 
-    print(f"rows: {len(rows)}, dtypes: {sorted(dtypes)}, contexts: {contexts}")
-    print(f"batch-1 tokens/s: {b1}, batch-8 tokens/s: {b8}")
+    # sanity 3: measured KV within a factor of 2 of the formula
+    kv = load_json("kv_check.json")
+    measured = kv.get("measured_kb_per_token")
+    if not isinstance(measured, (int, float)) or measured <= 0:
+        fail("kv_check.json needs a positive measured_kb_per_token")
+    lo, hi = KV_FORMULA_KB_PER_TOKEN / 2, KV_FORMULA_KB_PER_TOKEN * 2
+    if not lo <= measured <= hi:
+        fail(f"measured KV {measured} KB/token outside 2x of formula "
+             f"{KV_FORMULA_KB_PER_TOKEN} (allowed {lo:.1f} to {hi:.1f})")
+
+    print(f"ttft lengths: {sorted(b['ttft_s'])}, tpot_s: {tpot}")
+    print(f"batch tokens/s 1/4/8: {b['batch']['1']}/{b['batch']['4']}/"
+          f"{b['batch']['8']}")
+    print(f"KV measured {measured} KB/token vs formula "
+          f"{KV_FORMULA_KB_PER_TOKEN} KB/token")
     print("GREEN CHECK: PASS")
 
 
